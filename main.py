@@ -5,8 +5,6 @@ Variables de entorno requeridas en Railway:
   DATABASE_URL        → URL de PostgreSQL (Railway la inyecta automáticamente)
   TELEGRAM_TOKEN      → Token del bot obtenido desde @BotFather
   ANTHROPIC_API_KEY   → API key de Anthropic
-  API_KEY             → Clave secreta para proteger los endpoints REST
-  WEBHOOK_URL         → URL pública de Railway, ej: https://tu-app.railway.app
 """
 
 import os
@@ -19,7 +17,7 @@ import psycopg2.extras
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import anthropic
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -38,12 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DATABASE_URL     = os.environ["DATABASE_URL"]
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+DATABASE_URL      = os.environ["DATABASE_URL"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-API_KEY          = os.environ["API_KEY"]
-WEBHOOK_URL      = os.environ["WEBHOOK_URL"]   # ej: https://tu-app.railway.app
-PORT             = int(os.environ.get("PORT", 8080))
+PORT              = int(os.environ.get("PORT", 8080))
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -79,19 +75,7 @@ def init_db():
 # ─────────────────────────────────────────────
 
 app = Flask(__name__)
-CORS(app)   # Permite llamadas desde el frontend en Vercel
-
-
-def require_api_key(f):
-    """Decorador: bloquea requests sin API key válida."""
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        key = request.headers.get("x-api-key") or request.args.get("api_key")
-        if key != API_KEY:
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
+CORS(app)
 
 
 @app.route("/health", methods=["GET"])
@@ -100,7 +84,6 @@ def health():
 
 
 @app.route("/tasks", methods=["GET"])
-@require_api_key
 def get_tasks():
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -117,9 +100,8 @@ def get_tasks():
 
 
 @app.route("/tasks", methods=["POST"])
-@require_api_key
 def create_task():
-    data = request.get_json(force=True)
+    data     = request.get_json(force=True)
     text     = data.get("text", "").strip()
     status   = data.get("status", "todo")
     priority = int(data.get("priority", 5))
@@ -145,9 +127,8 @@ def create_task():
 
 
 @app.route("/tasks/<int:task_id>", methods=["PATCH"])
-@require_api_key
 def update_task(task_id):
-    data = request.get_json(force=True)
+    data   = request.get_json(force=True)
     fields = []
     values = []
 
@@ -188,7 +169,6 @@ def update_task(task_id):
 
 
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
-@require_api_key
 def delete_task(task_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -204,7 +184,7 @@ def delete_task(task_id):
 # CLAUDE — MOTOR DE RAZONAMIENTO
 # ─────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Eres el asistente de una lista de tareas (to-do list). 
+SYSTEM_PROMPT = """Eres el asistente de una lista de tareas (to-do list).
 Tu único trabajo es interpretar el mensaje del usuario y devolver una acción JSON.
 
 La lista actual de tareas se incluirá en el mensaje del usuario.
@@ -234,7 +214,6 @@ Reglas:
 
 
 def ask_claude(user_message: str, tasks: list) -> dict:
-    """Llama a Claude con el mensaje del usuario y la lista de tareas actual."""
     tasks_summary = "\n".join(
         f"  id={t['id']} | '{t['text']}' | estado={t['status']} | prioridad={t['priority']}"
         for t in tasks
@@ -253,7 +232,6 @@ Mensaje del usuario: \"{user_message}\""""
     )
 
     raw = message.content[0].text.strip()
-    # Eliminar posibles bloques de código si Claude los incluye
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -266,7 +244,6 @@ Mensaje del usuario: \"{user_message}\""""
 # ─────────────────────────────────────────────
 
 def fetch_tasks_internal():
-    """Obtiene tareas directamente desde la BD (llamada interna, sin HTTP)."""
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
@@ -281,7 +258,6 @@ def fetch_tasks_internal():
 
 
 def execute_action(action: dict) -> str:
-    """Ejecuta la acción decidida por Claude sobre la BD."""
     a = action.get("action")
 
     if a == "list":
@@ -289,10 +265,10 @@ def execute_action(action: dict) -> str:
         if not tasks:
             return "Tu lista está vacía. ¡Agrega una tarea!"
         STATUS_LABELS = {"todo": "📋 Por Hacer", "prog": "⚙️ En Progreso", "done": "✅ Hecho"}
-        lines = []
-        for t in tasks:
-            label = STATUS_LABELS.get(t["status"], t["status"])
-            lines.append(f"[{t['id']}] P{t['priority']} — {t['text']}  ({label})")
+        lines = [
+            f"[{t['id']}] P{t['priority']} — {t['text']}  ({STATUS_LABELS.get(t['status'], t['status'])})"
+            for t in tasks
+        ]
         return "Tus tareas:\n\n" + "\n".join(lines)
 
     if a == "create":
@@ -351,8 +327,13 @@ def execute_action(action: dict) -> str:
             return f"No encontré la tarea #{task_id}."
         return action.get("reply") or f"🗑️ Tarea #{task_id} eliminada."
 
-    # unknown
-    return action.get("reply") or "No entendí tu mensaje. Puedes decirme cosas como:\n• \"agrega comprar pan prioridad 7\"\n• \"mueve el dentista a en progreso\"\n• \"elimina la tarea de gym\"\n• \"muéstrame mis tareas\""
+    return action.get("reply") or (
+        "No entendí tu mensaje. Puedes decirme cosas como:\n"
+        "• \"agrega comprar pan prioridad 7\"\n"
+        "• \"mueve el dentista a en progreso\"\n"
+        "• \"elimina la tarea de gym\"\n"
+        "• \"muéstrame mis tareas\""
+    )
 
 
 def handle_start(update: Update, context: CallbackContext):
@@ -370,7 +351,6 @@ def handle_start(update: Update, context: CallbackContext):
 def handle_message(update: Update, context: CallbackContext):
     user_text = update.message.text
     logger.info(f"Mensaje recibido: {user_text}")
-
     try:
         tasks  = fetch_tasks_internal()
         action = ask_claude(user_text, tasks)
@@ -382,7 +362,6 @@ def handle_message(update: Update, context: CallbackContext):
     except Exception as e:
         logger.error(f"Error procesando mensaje: {e}")
         reply = "Ocurrió un error inesperado. Inténtalo en un momento."
-
     update.message.reply_text(reply)
 
 
@@ -390,43 +369,19 @@ def handle_message(update: Update, context: CallbackContext):
 # ARRANQUE
 # ─────────────────────────────────────────────
 
-def start_bot():
-    """Inicia el bot de Telegram en un hilo separado usando webhook."""
-    bot = Bot(token=TELEGRAM_TOKEN)
+def run_bot():
+    """Corre el bot con polling en un hilo separado."""
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
-
     dp.add_handler(CommandHandler("start", handle_start))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-    webhook_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
-    bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook configurado en: {webhook_url}")
-
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=f"/webhook/{TELEGRAM_TOKEN}",
-        webhook_url=webhook_url,
-    )
-    logger.info("Bot de Telegram iniciado.")
-
-
-@app.route(f"/webhook/<token>", methods=["POST"])
-def telegram_webhook(token):
-    """Flask recibe los updates de Telegram y los pasa al bot."""
-    if token != TELEGRAM_TOKEN:
-        return jsonify({"error": "Forbidden"}), 403
-    update = Update.de_json(request.get_json(force=True), Bot(token=TELEGRAM_TOKEN))
-    # Procesar en hilo separado para no bloquear Flask
-    threading.Thread(
-        target=lambda: Updater(token=TELEGRAM_TOKEN, use_context=True).dispatcher.process_update(update)
-    ).start()
-    return "ok", 200
+    logger.info("Bot iniciado con polling.")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":
     init_db()
-    start_bot()
-    # Flask sirve tanto la API REST como el webhook de Telegram
+    # Bot corre en hilo separado; Flask sirve la API REST en el hilo principal
+    threading.Thread(target=run_bot, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
