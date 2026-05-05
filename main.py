@@ -3,39 +3,36 @@ import json
 import logging
 import psycopg2
 import psycopg2.extras
-from flask import Flask, request
-from flask_cors import CORS
-from telegram import Update, Bot
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
 import anthropic
+from telegram import Update, Bot
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 # ── Config from environment ────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-DATABASE_URL     = os.environ["DATABASE_URL"]
-WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")   # e.g. https://your-app.railway.app
-PORT             = int(os.environ.get("PORT", 8080))
+DATABASE_URL      = os.environ["DATABASE_URL"]
 
 # ── Clients ────────────────────────────────────────────────────────────────────
-bot              = Bot(token=TELEGRAM_TOKEN)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-app = Flask(__name__)
-CORS(app)
 
 # ── Database ───────────────────────────────────────────────────────────────────
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
-    """Create the tasks table if it doesn't exist."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -61,7 +58,7 @@ def db_add_task(text: str, priority: int = 5) -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "INSERT INTO tasks (text, status, priority) VALUES (%s, 'todo', %s) RETURNING *",
-                (text, priority)
+                (text, priority),
             )
             row = cur.fetchone()
         conn.commit()
@@ -75,7 +72,7 @@ def db_delete_task(task_id: int) -> bool:
         conn.commit()
     return deleted
 
-def db_update_task(task_id: int, text: str = None, status: str = None, priority: int = None) -> dict | None:
+def db_update_task(task_id: int, text=None, status=None, priority=None):
     fields, values = [], []
     if text     is not None: fields.append("text = %s");     values.append(text)
     if status   is not None: fields.append("status = %s");   values.append(status)
@@ -87,7 +84,7 @@ def db_update_task(task_id: int, text: str = None, status: str = None, priority:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 f"UPDATE tasks SET {', '.join(fields)} WHERE id = %s RETURNING *",
-                values
+                values,
             )
             row = cur.fetchone()
         conn.commit()
@@ -141,7 +138,6 @@ Si la instrucción no corresponde a ninguna acción válida, responde:
 """
 
 def interpret_message(user_text: str, task_context: str) -> dict:
-    """Send user message to Claude and get back a structured action."""
     try:
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -150,9 +146,12 @@ def interpret_message(user_text: str, task_context: str) -> dict:
             messages=[
                 {
                     "role": "user",
-                    "content": f"Tareas actuales en la base de datos:\n{task_context}\n\nInstrucción del usuario: {user_text}"
+                    "content": (
+                        f"Tareas actuales en la base de datos:\n{task_context}"
+                        f"\n\nInstrucción del usuario: {user_text}"
+                    ),
                 }
-            ]
+            ],
         )
         raw = response.content[0].text.strip()
         return json.loads(raw)
@@ -164,15 +163,16 @@ def interpret_message(user_text: str, task_context: str) -> dict:
         return {"action": "unknown", "clarification": f"Error al contactar el modelo: {e}"}
 
 def build_task_context() -> str:
-    """Build a compact text summary of current tasks for Claude's context."""
     try:
         tasks = db_get_tasks()
         if not tasks:
             return "No hay tareas en este momento."
         lines = []
         for t in tasks:
-            status_label = {"todo": "Por hacer", "prog": "En progreso", "done": "Hecho"}.get(t["status"], t["status"])
-            lines.append(f"ID {t['id']}: [{status_label}] P{t['priority']} — {t['text']}")
+            label = {"todo": "Por hacer", "prog": "En progreso", "done": "Hecho"}.get(
+                t["status"], t["status"]
+            )
+            lines.append(f"ID {t['id']}: [{label}] P{t['priority']} — {t['text']}")
         return "\n".join(lines)
     except Exception:
         return "No se pudo obtener el listado de tareas."
@@ -190,7 +190,7 @@ def cmd_start(update: Update, context: CallbackContext):
         "• *elimina la tarea 5*\n"
         "• *muéstrame mis tareas*\n\n"
         "Usa /lista para ver todas tus tareas en cualquier momento.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 def cmd_lista(update: Update, context: CallbackContext):
@@ -228,15 +228,14 @@ def handle_message(update: Update, context: CallbackContext):
     try:
         if action == "add":
             text     = action_data.get("text", "").strip()
-            priority = int(action_data.get("priority", 5))
+            priority = max(1, min(10, int(action_data.get("priority", 5))))
             if not text:
                 update.message.reply_text("No entendí el texto de la tarea. ¿Puedes repetirlo?")
                 return
-            priority = max(1, min(10, priority))
             task = db_add_task(text, priority)
             update.message.reply_text(
                 f"✅ Tarea creada\n`ID {task['id']}` · P{task['priority']}\n_{task['text']}_",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
 
         elif action == "delete":
@@ -262,10 +261,11 @@ def handle_message(update: Update, context: CallbackContext):
                 priority = max(1, min(10, int(priority)))
             task = db_update_task(task_id, text=text, status=status, priority=priority)
             if task:
-                status_label = STATUS_LABEL.get(task["status"], task["status"])
+                sl = STATUS_LABEL.get(task["status"], task["status"])
+                se = STATUS_EMOJI.get(task["status"], "")
                 update.message.reply_text(
-                    f"✏️ Tarea actualizada\n`ID {task['id']}` · {STATUS_EMOJI.get(task['status'], '')} {status_label} · P{task['priority']}\n_{task['text']}_",
-                    parse_mode="Markdown"
+                    f"✏️ Tarea actualizada\n`ID {task['id']}` · {se} {sl} · P{task['priority']}\n_{task['text']}_",
+                    parse_mode="Markdown",
                 )
             else:
                 update.message.reply_text(f"No encontré una tarea con ID {task_id}.")
@@ -275,7 +275,9 @@ def handle_message(update: Update, context: CallbackContext):
 
         elif action == "unknown":
             clarification = action_data.get("clarification", "No entendí la instrucción.")
-            update.message.reply_text(f"🤔 {clarification}\n\nEscribe /lista para ver tus tareas actuales.")
+            update.message.reply_text(
+                f"🤔 {clarification}\n\nEscribe /lista para ver tus tareas actuales."
+            )
 
         else:
             update.message.reply_text("No reconocí esa acción. Intenta de nuevo o escribe /lista.")
@@ -284,38 +286,17 @@ def handle_message(update: Update, context: CallbackContext):
         logger.error("handle_message error: %s", e)
         update.message.reply_text("Ocurrió un error al ejecutar la acción. Intenta de nuevo.")
 
-# ── Flask routes ───────────────────────────────────────────────────────────────
-dispatcher = Dispatcher(bot, None, use_context=True)
-dispatcher.add_handler(CommandHandler("start", cmd_start))
-dispatcher.add_handler(CommandHandler("lista", cmd_lista))
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    data   = request.get_json(force=True)
-    update = Update.de_json(data, bot)
-    dispatcher.process_update(update)
-    return "ok", 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return {"status": "ok"}, 200
-
-@app.route("/set_webhook", methods=["GET"])
-def set_webhook():
-    if not WEBHOOK_URL:
-        return {"error": "WEBHOOK_URL env var not set"}, 400
-    url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
-    result = bot.set_webhook(url=url)
-    return {"webhook_set": result, "url": url}, 200
-
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point — polling ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
-    if WEBHOOK_URL:
-        webhook_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
-        bot.set_webhook(url=webhook_url)
-        logger.info("Webhook set to %s", webhook_url)
-    else:
-        logger.warning("WEBHOOK_URL not set — webhook not registered. Call /set_webhook after deploy.")
-    app.run(host="0.0.0.0", port=PORT)
+
+    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("lista", cmd_lista))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+
+    logger.info("Bot iniciado en modo polling...")
+    updater.start_polling(poll_interval=2.0, timeout=20, drop_pending_updates=True)
+    updater.idle()
