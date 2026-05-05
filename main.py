@@ -1,10 +1,13 @@
 import os
 import json
 import logging
+import threading
 import psycopg2
 import psycopg2.extras
 import anthropic
-from telegram import Update, Bot
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from telegram import Update
 from telegram.ext import (
     Updater,
     CommandHandler,
@@ -24,9 +27,26 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DATABASE_URL      = os.environ["DATABASE_URL"]
+PORT              = int(os.environ.get("PORT", 8080))
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Flask app ──────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+
+@app.route("/tasks", methods=["OPTIONS"])
+@app.route("/tasks/<int:task_id>", methods=["OPTIONS"])
+def handle_options(task_id=None):
+    return "", 204
 
 # ── Database ───────────────────────────────────────────────────────────────────
 def get_conn():
@@ -47,11 +67,17 @@ def init_db():
         conn.commit()
     logger.info("Database ready.")
 
+def serialize(row):
+    d = dict(row)
+    if d.get("created"):
+        d["created"] = d["created"].isoformat()
+    return d
+
 def db_get_tasks():
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM tasks ORDER BY priority DESC, created DESC")
-            return cur.fetchall()
+            return [serialize(r) for r in cur.fetchall()]
 
 def db_add_task(text: str, priority: int = 5) -> dict:
     with get_conn() as conn:
@@ -62,7 +88,7 @@ def db_add_task(text: str, priority: int = 5) -> dict:
             )
             row = cur.fetchone()
         conn.commit()
-    return dict(row)
+    return serialize(row)
 
 def db_delete_task(task_id: int) -> bool:
     with get_conn() as conn:
@@ -88,7 +114,62 @@ def db_update_task(task_id: int, text=None, status=None, priority=None):
             )
             row = cur.fetchone()
         conn.commit()
-    return dict(row) if row else None
+    return serialize(row) if row else None
+
+# ── REST API routes ────────────────────────────────────────────────────────────
+@app.route("/tasks", methods=["GET"])
+def api_get_tasks():
+    try:
+        return jsonify(db_get_tasks()), 200
+    except Exception as e:
+        logger.error("GET /tasks error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/tasks", methods=["POST"])
+def api_add_task():
+    try:
+        body     = request.get_json(force=True)
+        text     = body.get("text", "").strip()
+        priority = max(1, min(10, int(body.get("priority", 5))))
+        if not text:
+            return jsonify({"error": "text is required"}), 400
+        task = db_add_task(text, priority)
+        return jsonify(task), 201
+    except Exception as e:
+        logger.error("POST /tasks error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/tasks/<int:task_id>", methods=["PATCH"])
+def api_update_task(task_id):
+    try:
+        body     = request.get_json(force=True)
+        text     = body.get("text")
+        status   = body.get("status")
+        priority = body.get("priority")
+        if priority is not None:
+            priority = max(1, min(10, int(priority)))
+        task = db_update_task(task_id, text=text, status=status, priority=priority)
+        if not task:
+            return jsonify({"error": "task not found"}), 404
+        return jsonify(task), 200
+    except Exception as e:
+        logger.error("PATCH /tasks/%s error: %s", task_id, e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/tasks/<int:task_id>", methods=["DELETE"])
+def api_delete_task(task_id):
+    try:
+        ok = db_delete_task(task_id)
+        if not ok:
+            return jsonify({"error": "task not found"}), 404
+        return jsonify({"deleted": task_id}), 200
+    except Exception as e:
+        logger.error("DELETE /tasks/%s error: %s", task_id, e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 # ── Anthropic NLP ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
@@ -286,17 +367,24 @@ def handle_message(update: Update, context: CallbackContext):
         logger.error("handle_message error: %s", e)
         update.message.reply_text("Ocurrió un error al ejecutar la acción. Intenta de nuevo.")
 
-# ── Entry point — polling ──────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     init_db()
 
+    # Bot en hilo separado
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
-
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("lista", cmd_lista))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-    logger.info("Bot iniciado en modo polling...")
-    updater.start_polling(poll_interval=2.0, timeout=20, drop_pending_updates=True)
-    updater.idle()
+    bot_thread = threading.Thread(target=lambda: (
+        updater.start_polling(poll_interval=2.0, timeout=20, drop_pending_updates=True),
+        updater.idle()
+    ), daemon=True)
+    bot_thread.start()
+    logger.info("Bot iniciado en modo polling (hilo separado).")
+
+    # Flask en hilo principal
+    logger.info("API REST escuchando en puerto %s.", PORT)
+    app.run(host="0.0.0.0", port=PORT)
